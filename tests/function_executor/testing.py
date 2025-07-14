@@ -1,15 +1,20 @@
 import os
 import subprocess
+import tempfile
 import unittest
 from typing import Any, Dict, List, Optional
 
 import grpc
 
 from tensorlake.function_executor.proto.function_executor_pb2 import (
+    BLOBChunk,
+    ReadOnlyBLOB,
     RunTaskRequest,
     RunTaskResponse,
-    SerializedObject,
     SerializedObjectEncoding,
+    SerializedObjectInsideBLOB,
+    SerializedObjectManifest,
+    WriteOnlyBlob,
 )
 from tensorlake.function_executor.proto.function_executor_pb2_grpc import (
     FunctionExecutorStub,
@@ -27,13 +32,12 @@ class FunctionExecutorProcessContextManager:
         self,
         port: int = DEFAULT_FUNCTION_EXECUTOR_PORT,
         extra_args: List[str] = [],
-        keep_std_outputs: bool = True,
         extra_env: Dict[str, str] = {},
+        capture_std_outputs: bool = False,
     ):
         self.port = port
         self._args = [
             "function-executor",
-            "--dev",
             "--address",
             f"localhost:{port}",
             "--executor-id",
@@ -42,25 +46,38 @@ class FunctionExecutorProcessContextManager:
             "test-function-executor",
         ]
         self._args.extend(extra_args)
-        self._keep_std_outputs = keep_std_outputs
         self._extra_env = extra_env
+        self._capture_std_outputs = capture_std_outputs
         self._process: Optional[subprocess.Popen] = None
+        self._stdout: Optional[str] = None
+        self._stderr: Optional[str] = None
 
     def __enter__(self) -> "FunctionExecutorProcessContextManager":
         kwargs = {}
-        if not self._keep_std_outputs:
-            kwargs["stdout"] = subprocess.DEVNULL
-            kwargs["stderr"] = subprocess.DEVNULL
         if self._extra_env is not None:
             kwargs["env"] = os.environ.copy()
             kwargs["env"].update(self._extra_env)
+        if self._capture_std_outputs:
+            kwargs["stdout"] = subprocess.PIPE
+            kwargs["stderr"] = subprocess.PIPE
         self._process = subprocess.Popen(self._args, **kwargs)
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
         if self._process:
             self._process.terminate()
-            self._process.wait()
+            if self._capture_std_outputs:
+                self._stdout = self._process.stdout.read().decode("utf-8")
+                self._stderr = self._process.stderr.read().decode("utf-8")
+            self._process.__exit__(exc_type, exc_value, traceback)
+
+    def read_stdout(self) -> Optional[str]:
+        # Only call this after FE exits.
+        return self._stdout
+
+    def read_stderr(self) -> Optional[str]:
+        # Only call this after FE exits.
+        return self._stderr
 
 
 def rpc_channel(context_manager: FunctionExecutorProcessContextManager) -> grpc.Channel:
@@ -82,8 +99,18 @@ def rpc_channel(context_manager: FunctionExecutorProcessContextManager) -> grpc.
 
 
 def run_task(
-    stub: FunctionExecutorStub, function_name: str, input: Any, **kwargs
+    stub: FunctionExecutorStub,
+    function_name: str,
+    input: Any,
+    function_outputs_blob: WriteOnlyBlob,
+    timeout_sec: Optional[int] = None,
 ) -> RunTaskResponse:
+    function_input_blob: ReadOnlyBLOB = tmp_local_file_ro_blob()
+    function_input_path: str = function_input_blob.uri.replace("file://", "", 1)
+    function_input_data: bytes = CloudPickleSerializer.serialize(input)
+    with open(function_input_path, "wb") as f:
+        f.write(function_input_data)
+
     return stub.run_task(
         RunTaskRequest(
             namespace="test",
@@ -93,37 +120,73 @@ def run_task(
             graph_invocation_id="123",
             task_id="test-task",
             allocation_id="test-allocation",
-            function_input=SerializedObject(
-                data=CloudPickleSerializer.serialize(input),
-                encoding=SerializedObjectEncoding.SERIALIZED_OBJECT_ENCODING_BINARY_PICKLE,
-                encoding_version=0,
+            function_input_blob=function_input_blob,
+            function_input=SerializedObjectInsideBLOB(
+                manifest=SerializedObjectManifest(
+                    encoding=SerializedObjectEncoding.SERIALIZED_OBJECT_ENCODING_BINARY_PICKLE,
+                    encoding_version=0,
+                    size=len(function_input_data),
+                ),
+                offset=0,
             ),
+            function_outputs_blob=function_outputs_blob,
         ),
-        **kwargs,
+        timeout=timeout_sec,
     )
 
 
 def deserialized_function_output(
-    test_case: unittest.TestCase, function_outputs: List[SerializedObject]
+    test_case: unittest.TestCase,
+    function_outputs: List[SerializedObjectInsideBLOB],
+    function_outputs_blob: WriteOnlyBlob,
 ) -> List[Any]:
     outputs: List[Any] = []
     for output in function_outputs:
         test_case.assertEqual(
-            output.encoding,
+            output.manifest.encoding,
             SerializedObjectEncoding.SERIALIZED_OBJECT_ENCODING_BINARY_PICKLE,
         )
-        outputs.append(CloudPickleSerializer.deserialize(output.data))
+        data: bytes = read_local_rw_blob_bytes(
+            function_outputs_blob, output.offset, output.manifest.size
+        )
+        outputs.append(CloudPickleSerializer.deserialize(data))
     return outputs
 
 
-def copy_and_modify_request(
-    src: RunTaskRequest, modifications: Dict[str, Any]
-) -> RunTaskRequest:
-    request = RunTaskRequest()
-    request.CopyFrom(src)
-    for key, value in modifications.items():
-        setattr(request, key, value)
-    return request
+def tmp_local_file_ro_blob() -> ReadOnlyBLOB:
+    """Returns a temporary local file blob."""
+    temp_file = tempfile.NamedTemporaryFile(delete=False)
+    temp_file.close()
+    return ReadOnlyBLOB(
+        uri=f"file://{os.path.abspath(temp_file.name)}",
+    )
 
 
-FOO = "FOO"
+def read_local_ro_blob_str(blob: ReadOnlyBLOB) -> str:
+    """Reads a local blob and returns its content as a string."""
+    file_path: str = blob.uri.replace("file://", "", 1)
+    with open(file_path, "r") as f:
+        return f.read()
+
+
+# TODO: Use multiple chunks
+def tmp_local_file_rw_blob() -> WriteOnlyBlob:
+    """Returns a temporary local file blob for writing."""
+    temp_file = tempfile.NamedTemporaryFile(delete=False)
+    temp_file.close()
+    return WriteOnlyBlob(
+        chunks=[
+            BLOBChunk(
+                uri=f"file://{os.path.abspath(temp_file.name)}", size=5 * 1024 * 1024
+            )
+        ],
+    )
+
+
+# TODO: Use multiple chunks
+def read_local_rw_blob_bytes(blob: WriteOnlyBlob, offset: int, size: int) -> bytes:
+    """Reads a local blob and returns its content as bytes."""
+    file_path: str = blob.chunks[0].uri.replace("file://", "", 1)
+    with open(file_path, "rb") as f:
+        f.seek(offset)
+        return f.read(size)

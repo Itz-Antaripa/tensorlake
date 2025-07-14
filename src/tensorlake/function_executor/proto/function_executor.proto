@@ -14,11 +14,49 @@ enum SerializedObjectEncoding {
     SERIALIZED_OBJECT_ENCODING_BINARY_ZIP = 4;
 }
 
-// Complete serialized object passed in a single message without any chunking.
+message SerializedObjectManifest {
+    optional SerializedObjectEncoding encoding = 1;
+    optional uint64 encoding_version = 2;
+    optional uint64 size = 3;
+}
+
+// Full serialized object with all its data.
 message SerializedObject {
-    optional bytes data = 1;
-    optional SerializedObjectEncoding encoding = 2;
-    optional uint64 encoding_version = 3;
+    optional SerializedObjectManifest manifest = 1;
+    optional bytes data = 2;
+}
+
+// A read-only BLOB in a BLOB store.
+message ReadOnlyBLOB {
+    // URI of the blob.
+    // S3 URI if the data is stored in S3.
+    // Starts with "file://"" prefix if the data is stored on a local file system.
+    optional string uri = 1;
+}
+
+// A chunk of a BLOB in a BLOB store.
+message BLOBChunk {
+    // URI of the chunk.
+    // S3 URI if the data is stored in S3.
+    // Starts with "file://"" prefix if the data is stored on a local file system.
+    optional string uri = 1;
+    // The size of the chunk in bytes.
+    optional uint64 size = 2;
+}
+
+// A write-only BLOB in a BLOB store.
+message WriteOnlyBlob {
+    // Writable chunks of the BLOB.
+    // The maximum blob size is limited by the maximum number and size of the chunks.
+    repeated BLOBChunk chunks = 1;
+}
+
+// Serialized object stored inside a BLOB.
+// The BLOB is determined from the protocol context.
+message SerializedObjectInsideBLOB {
+    optional SerializedObjectManifest manifest = 1;
+    // Offset inside the BLOB where the serialized object data starts.
+    optional uint64 offset = 2;
 }
 
 // InitializeRequest contains information about the function
@@ -27,8 +65,8 @@ message InitializeRequest {
     optional string namespace = 1;
     optional string graph_name = 2;
     optional string graph_version = 3;
-    optional string function_name = 5;
-    optional SerializedObject graph = 7;
+    optional string function_name = 4;
+    optional SerializedObject graph = 5;
 }
 
 enum InitializationOutcomeCode {
@@ -43,11 +81,16 @@ enum InitializationFailureReason {
     INITIALIZATION_FAILURE_REASON_FUNCTION_ERROR = 2;
 }
 
+message InitializeDiagnostics {
+    // Function Executor log.
+    // Doesn't contain any function logs or any other customer data.
+    optional string log = 1;
+}
+
 message InitializeResponse {
     optional InitializationOutcomeCode outcome_code = 1;
     optional InitializationFailureReason failure_reason = 2;
-    optional string stdout = 3;
-    optional string stderr = 4;
+    optional InitializeDiagnostics diagnostics = 3;
 }
 
 message SetInvocationStateRequest {
@@ -100,9 +143,12 @@ message RunTaskRequest {
     optional string function_name = 4;
     optional string graph_invocation_id = 5;
     optional string task_id = 6;
-    optional string allocation_id = 9;
-    optional SerializedObject function_input = 7;
-    optional SerializedObject function_init_value = 8;
+    optional string allocation_id = 7;
+    optional ReadOnlyBLOB function_input_blob = 8;
+    optional SerializedObjectInsideBLOB function_input = 9;
+    optional ReadOnlyBLOB function_init_value_blob = 10;
+    optional SerializedObjectInsideBLOB function_init_value = 11;
+    optional WriteOnlyBlob function_outputs_blob = 12;
 }
 
 message Metrics {
@@ -123,19 +169,25 @@ enum TaskFailureReason {
     TASK_FAILURE_REASON_INVOCATION_ERROR = 3;
 }
 
+message RunTaskDiagnostics {
+    // Function Executor log for diagnostics.
+    // Doesn't contain any function logs or any other customer data.
+    optional string log = 1;
+}
+
 message RunTaskResponse {
     optional string task_id = 1;
-    repeated SerializedObject function_outputs = 2;
-    // Edges that the function wants the invocation to be routed to.
-    repeated string next_functions = 3;
-    optional string stdout = 4;
-    optional string stderr = 5;
-    optional bool is_reducer = 6;
-    optional Metrics metrics = 7;
-    optional TaskOutcomeCode outcome_code = 8;
-    optional TaskFailureReason failure_reason = 9;
+    optional TaskOutcomeCode outcome_code = 2;
+    optional TaskFailureReason failure_reason = 3;
+    // Function outputs stored inside function_outputs_blob.
+    repeated SerializedObjectInsideBLOB function_outputs = 4;
     // User payload for invocation error if task failed with invocation error.
-    optional SerializedObject invocation_error_output = 10;
+    // Stored inside function_outputs_blob.
+    optional SerializedObjectInsideBLOB invocation_error_output = 5;
+    // Edges that the function wants the invocation to be routed to.
+    repeated string next_functions = 6;
+    optional Metrics metrics = 7;
+    optional RunTaskDiagnostics diagnostics = 8;
 }
 
 message HealthCheckRequest {}

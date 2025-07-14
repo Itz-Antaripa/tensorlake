@@ -1,11 +1,12 @@
 import unittest
 
 from testing import (
-    DEFAULT_FUNCTION_EXECUTOR_PORT,
     FunctionExecutorProcessContextManager,
     deserialized_function_output,
+    read_local_rw_blob_bytes,
     rpc_channel,
     run_task,
+    tmp_local_file_rw_blob,
 )
 
 from tensorlake import Graph, InvocationError
@@ -16,6 +17,7 @@ from tensorlake.function_executor.proto.function_executor_pb2 import (
     RunTaskResponse,
     SerializedObject,
     SerializedObjectEncoding,
+    SerializedObjectManifest,
     TaskFailureReason,
     TaskOutcomeCode,
 )
@@ -41,11 +43,15 @@ class TestInvocationError(unittest.TestCase):
         graph = Graph(
             name="test", description="test", start_node=raise_invocation_error
         )
-        with FunctionExecutorProcessContextManager(
-            DEFAULT_FUNCTION_EXECUTOR_PORT
-        ) as process:
+        graph_data: bytes = zip_graph_code(
+            graph=graph,
+            code_dir_path=GRAPH_CODE_DIR_PATH,
+        )
+
+        with FunctionExecutorProcessContextManager() as process:
             with rpc_channel(process) as channel:
                 stub: FunctionExecutorStub = FunctionExecutorStub(channel)
+
                 initialize_response: InitializeResponse = stub.initialize(
                     InitializeRequest(
                         namespace="test",
@@ -53,12 +59,12 @@ class TestInvocationError(unittest.TestCase):
                         graph_version="1",
                         function_name="raise_invocation_error",
                         graph=SerializedObject(
-                            data=zip_graph_code(
-                                graph=graph,
-                                code_dir_path=GRAPH_CODE_DIR_PATH,
+                            manifest=SerializedObjectManifest(
+                                encoding=SerializedObjectEncoding.SERIALIZED_OBJECT_ENCODING_BINARY_ZIP,
+                                encoding_version=0,
+                                size=len(graph_data),
                             ),
-                            encoding=SerializedObjectEncoding.SERIALIZED_OBJECT_ENCODING_BINARY_ZIP,
-                            encoding_version=0,
+                            data=graph_data,
                         ),
                     )
                 )
@@ -67,10 +73,12 @@ class TestInvocationError(unittest.TestCase):
                     InitializationOutcomeCode.INITIALIZE_OUTCOME_CODE_SUCCESS,
                 )
 
+                function_outputs_blob = tmp_local_file_rw_blob()
                 run_task_response: RunTaskResponse = run_task(
                     stub,
                     function_name="raise_invocation_error",
                     input=10,
+                    function_outputs_blob=function_outputs_blob,
                 )
 
                 self.assertEqual(
@@ -82,16 +90,21 @@ class TestInvocationError(unittest.TestCase):
                     TaskFailureReason.TASK_FAILURE_REASON_INVOCATION_ERROR,
                 )
                 self.assertEqual(
-                    run_task_response.invocation_error_output.encoding,
+                    run_task_response.invocation_error_output.manifest.encoding,
                     SerializedObjectEncoding.SERIALIZED_OBJECT_ENCODING_UTF8_TEXT,
                 )
                 self.assertIn(
                     "The invocation can't succeed: 10",
-                    run_task_response.invocation_error_output.data.decode("utf-8"),
+                    read_local_rw_blob_bytes(
+                        function_outputs_blob,
+                        run_task_response.invocation_error_output.offset,
+                        run_task_response.invocation_error_output.manifest.size,
+                    ).decode("utf-8"),
                 )
-                self.assertFalse(run_task_response.is_reducer)
                 fn_outputs = deserialized_function_output(
-                    self, run_task_response.function_outputs
+                    self,
+                    run_task_response.function_outputs,
+                    function_outputs_blob=function_outputs_blob,
                 )
                 self.assertEqual(len(fn_outputs), 0)
 

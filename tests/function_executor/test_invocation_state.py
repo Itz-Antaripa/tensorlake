@@ -6,11 +6,11 @@ from typing import Any, Dict, Generator, Iterator, List
 import grpc
 from pydantic import BaseModel
 from testing import (
-    DEFAULT_FUNCTION_EXECUTOR_PORT,
     FunctionExecutorProcessContextManager,
     deserialized_function_output,
     rpc_channel,
     run_task,
+    tmp_local_file_rw_blob,
 )
 
 from tensorlake import Graph
@@ -25,9 +25,11 @@ from tensorlake.function_executor.proto.function_executor_pb2 import (
     RunTaskResponse,
     SerializedObject,
     SerializedObjectEncoding,
+    SerializedObjectManifest,
     SetInvocationStateRequest,
     SetInvocationStateResponse,
     TaskOutcomeCode,
+    WriteOnlyBlob,
 )
 from tensorlake.function_executor.proto.function_executor_pb2_grpc import (
     FunctionExecutorStub,
@@ -37,7 +39,6 @@ from tensorlake.functions_sdk.functions import (
     tensorlake_function,
 )
 from tensorlake.functions_sdk.graph_serialization import (
-    ZIPPED_GRAPH_CODE_CONTENT_TYPE,
     graph_code_dir_path,
     zip_graph_code,
 )
@@ -111,6 +112,10 @@ class TestSetInvocationState(unittest.TestCase):
             description="test",
             start_node=set_invocation_state,
         )
+        graph_data: bytes = zip_graph_code(
+            graph=graph,
+            code_dir_path=GRAPH_CODE_DIR_PATH,
+        )
         initialize_response: InitializeResponse = stub.initialize(
             InitializeRequest(
                 namespace="test",
@@ -118,9 +123,12 @@ class TestSetInvocationState(unittest.TestCase):
                 graph_version="1",
                 function_name="set_invocation_state",
                 graph=SerializedObject(
-                    data=zip_graph_code(graph=graph, code_dir_path=GRAPH_CODE_DIR_PATH),
-                    encoding=SerializedObjectEncoding.SERIALIZED_OBJECT_ENCODING_BINARY_ZIP,
-                    encoding_version=0,
+                    manifest=SerializedObjectManifest(
+                        encoding=SerializedObjectEncoding.SERIALIZED_OBJECT_ENCODING_BINARY_ZIP,
+                        encoding_version=0,
+                        size=len(graph_data),
+                    ),
+                    data=graph_data,
                 ),
             )
         )
@@ -130,9 +138,7 @@ class TestSetInvocationState(unittest.TestCase):
         )
 
     def test_success(self):
-        with FunctionExecutorProcessContextManager(
-            DEFAULT_FUNCTION_EXECUTOR_PORT
-        ) as fe:
+        with FunctionExecutorProcessContextManager() as fe:
             with rpc_channel(fe) as channel:
                 stub: FunctionExecutorStub = FunctionExecutorStub(channel)
                 self._initialize_function_executor(stub)
@@ -143,6 +149,11 @@ class TestSetInvocationState(unittest.TestCase):
                         set=SetInvocationStateRequest(
                             key="test_state_key",
                             value=SerializedObject(
+                                manifest=SerializedObjectManifest(
+                                    encoding=SerializedObjectEncoding.SERIALIZED_OBJECT_ENCODING_BINARY_PICKLE,
+                                    encoding_version=0,
+                                    size=0,
+                                ),
                                 data=CloudPickleSerializer.serialize(
                                     StructuredState(
                                         string="hello",
@@ -152,8 +163,6 @@ class TestSetInvocationState(unittest.TestCase):
                                         ),
                                     )
                                 ),
-                                encoding=SerializedObjectEncoding.SERIALIZED_OBJECT_ENCODING_BINARY_PICKLE,
-                                encoding_version=0,
                             ),
                         ),
                     ),
@@ -166,15 +175,19 @@ class TestSetInvocationState(unittest.TestCase):
                 client_thread = invocation_state_client_stub(
                     self, stub, expected_requests, responses
                 )
+                function_outputs_blob: WriteOnlyBlob = tmp_local_file_rw_blob()
                 run_task_response: RunTaskResponse = run_task(
-                    stub, function_name="set_invocation_state", input=42
+                    stub,
+                    function_name="set_invocation_state",
+                    input=42,
+                    function_outputs_blob=function_outputs_blob,
                 )
                 self.assertEqual(
                     run_task_response.outcome_code,
                     TaskOutcomeCode.TASK_OUTCOME_CODE_SUCCESS,
                 )
                 fn_outputs = deserialized_function_output(
-                    self, run_task_response.function_outputs
+                    self, run_task_response.function_outputs, function_outputs_blob
                 )
                 self.assertEqual(len(fn_outputs), 1)
                 self.assertEqual("success", fn_outputs[0])
@@ -185,9 +198,7 @@ class TestSetInvocationState(unittest.TestCase):
                 client_thread.join()
 
     def test_client_failure(self):
-        with FunctionExecutorProcessContextManager(
-            DEFAULT_FUNCTION_EXECUTOR_PORT + 1
-        ) as fe:
+        with FunctionExecutorProcessContextManager(capture_std_outputs=True) as fe:
             with rpc_channel(fe) as channel:
                 stub: FunctionExecutorStub = FunctionExecutorStub(channel)
                 self._initialize_function_executor(stub)
@@ -198,6 +209,11 @@ class TestSetInvocationState(unittest.TestCase):
                         set=SetInvocationStateRequest(
                             key="test_state_key",
                             value=SerializedObject(
+                                manifest=SerializedObjectManifest(
+                                    encoding=SerializedObjectEncoding.SERIALIZED_OBJECT_ENCODING_BINARY_PICKLE,
+                                    encoding_version=0,
+                                    size=0,
+                                ),
                                 data=CloudPickleSerializer.serialize(
                                     StructuredState(
                                         string="hello",
@@ -207,8 +223,6 @@ class TestSetInvocationState(unittest.TestCase):
                                         ),
                                     )
                                 ),
-                                encoding=SerializedObjectEncoding.SERIALIZED_OBJECT_ENCODING_BINARY_PICKLE,
-                                encoding_version=0,
                             ),
                         ),
                     ),
@@ -221,22 +235,27 @@ class TestSetInvocationState(unittest.TestCase):
                 client_thread = invocation_state_client_stub(
                     self, stub, expected_requests, responses
                 )
+                function_outputs_blob: WriteOnlyBlob = tmp_local_file_rw_blob()
                 run_task_response: RunTaskResponse = run_task(
-                    stub, function_name="set_invocation_state", input=42
+                    stub,
+                    function_name="set_invocation_state",
+                    input=42,
+                    function_outputs_blob=function_outputs_blob,
                 )
                 self.assertEqual(
                     run_task_response.outcome_code,
                     TaskOutcomeCode.TASK_OUTCOME_CODE_FAILURE,
-                )
-                self.assertTrue(
-                    'RuntimeError("failed to set the invocation state for key")'
-                    in run_task_response.stderr
                 )
 
                 print(
                     "Joining invocation state client thread, it should exit immediately..."
                 )
                 client_thread.join()
+
+        self.assertIn(
+            'RuntimeError("failed to set the invocation state for key")',
+            fe.read_stderr(),
+        )
 
 
 @tensorlake_function(inject_ctx=True)
@@ -271,6 +290,10 @@ class TestGetInvocationState(unittest.TestCase):
     def _initialize_function_executor(
         self, graph: Graph, function_name: str, stub: FunctionExecutorStub
     ):
+        graph_data: bytes = zip_graph_code(
+            graph=graph,
+            code_dir_path=GRAPH_CODE_DIR_PATH,
+        )
         initialize_response: InitializeResponse = stub.initialize(
             InitializeRequest(
                 namespace="test",
@@ -278,9 +301,12 @@ class TestGetInvocationState(unittest.TestCase):
                 graph_version="1",
                 function_name=function_name,
                 graph=SerializedObject(
-                    data=zip_graph_code(graph=graph, code_dir_path=GRAPH_CODE_DIR_PATH),
-                    encoding=SerializedObjectEncoding.SERIALIZED_OBJECT_ENCODING_BINARY_ZIP,
-                    encoding_version=0,
+                    manifest=SerializedObjectManifest(
+                        encoding=SerializedObjectEncoding.SERIALIZED_OBJECT_ENCODING_BINARY_ZIP,
+                        encoding_version=0,
+                        size=len(graph_data),
+                    ),
+                    data=graph_data,
                 ),
             )
         )
@@ -290,9 +316,7 @@ class TestGetInvocationState(unittest.TestCase):
         )
 
     def test_success(self):
-        with FunctionExecutorProcessContextManager(
-            DEFAULT_FUNCTION_EXECUTOR_PORT + 2
-        ) as fe:
+        with FunctionExecutorProcessContextManager() as fe:
             with rpc_channel(fe) as channel:
                 stub: FunctionExecutorStub = FunctionExecutorStub(channel)
                 self._initialize_function_executor(
@@ -316,6 +340,11 @@ class TestGetInvocationState(unittest.TestCase):
                         get=GetInvocationStateResponse(
                             key="test_state_key",
                             value=SerializedObject(
+                                manifest=SerializedObjectManifest(
+                                    encoding=SerializedObjectEncoding.SERIALIZED_OBJECT_ENCODING_BINARY_PICKLE,
+                                    encoding_version=0,
+                                    size=0,
+                                ),
                                 data=CloudPickleSerializer.serialize(
                                     StructuredState(
                                         string="hello",
@@ -325,8 +354,6 @@ class TestGetInvocationState(unittest.TestCase):
                                         ),
                                     )
                                 ),
-                                encoding=SerializedObjectEncoding.SERIALIZED_OBJECT_ENCODING_BINARY_PICKLE,
-                                encoding_version=0,
                             ),
                         ),
                     ),
@@ -334,15 +361,19 @@ class TestGetInvocationState(unittest.TestCase):
                 client_thread = invocation_state_client_stub(
                     self, stub, expected_requests, responses
                 )
+                function_outputs_blob: WriteOnlyBlob = tmp_local_file_rw_blob()
                 run_task_response: RunTaskResponse = run_task(
-                    stub, function_name="check_invocation_state_is_expected", input=33
+                    stub,
+                    function_name="check_invocation_state_is_expected",
+                    input=33,
+                    function_outputs_blob=function_outputs_blob,
                 )
                 self.assertEqual(
                     run_task_response.outcome_code,
                     TaskOutcomeCode.TASK_OUTCOME_CODE_SUCCESS,
                 )
                 fn_outputs = deserialized_function_output(
-                    self, run_task_response.function_outputs
+                    self, run_task_response.function_outputs, function_outputs_blob
                 )
                 self.assertEqual(len(fn_outputs), 1)
                 self.assertEqual("success", fn_outputs[0])
@@ -359,9 +390,7 @@ class TestGetInvocationState(unittest.TestCase):
             start_node=check_invocation_state_is_none,
         )
 
-        with FunctionExecutorProcessContextManager(
-            DEFAULT_FUNCTION_EXECUTOR_PORT + 3
-        ) as fe:
+        with FunctionExecutorProcessContextManager() as fe:
             with rpc_channel(fe) as channel:
                 stub: FunctionExecutorStub = FunctionExecutorStub(channel)
                 self._initialize_function_executor(
@@ -389,15 +418,19 @@ class TestGetInvocationState(unittest.TestCase):
                 client_thread = invocation_state_client_stub(
                     self, stub, expected_requests, responses
                 )
+                function_outputs_blob: WriteOnlyBlob = tmp_local_file_rw_blob()
                 run_task_response: RunTaskResponse = run_task(
-                    stub, function_name="check_invocation_state_is_none", input=33
+                    stub,
+                    function_name="check_invocation_state_is_none",
+                    input=33,
+                    function_outputs_blob=function_outputs_blob,
                 )
                 self.assertEqual(
                     run_task_response.outcome_code,
                     TaskOutcomeCode.TASK_OUTCOME_CODE_SUCCESS,
                 )
                 fn_outputs = deserialized_function_output(
-                    self, run_task_response.function_outputs
+                    self, run_task_response.function_outputs, function_outputs_blob
                 )
                 self.assertEqual(len(fn_outputs), 1)
                 self.assertEqual("success", fn_outputs[0])
@@ -408,9 +441,7 @@ class TestGetInvocationState(unittest.TestCase):
                 client_thread.join()
 
     def test_client_failure(self):
-        with FunctionExecutorProcessContextManager(
-            DEFAULT_FUNCTION_EXECUTOR_PORT + 4
-        ) as fe:
+        with FunctionExecutorProcessContextManager(capture_std_outputs=True) as fe:
             with rpc_channel(fe) as channel:
                 stub: FunctionExecutorStub = FunctionExecutorStub(channel)
                 self._initialize_function_executor(
@@ -437,22 +468,26 @@ class TestGetInvocationState(unittest.TestCase):
                 client_thread = invocation_state_client_stub(
                     self, stub, expected_requests, responses
                 )
+                function_outputs_blob: WriteOnlyBlob = tmp_local_file_rw_blob()
                 run_task_response: RunTaskResponse = run_task(
-                    stub, function_name="check_invocation_state_is_expected", input=14
+                    stub,
+                    function_name="check_invocation_state_is_expected",
+                    input=14,
+                    function_outputs_blob=function_outputs_blob,
                 )
                 self.assertEqual(
                     run_task_response.outcome_code,
                     TaskOutcomeCode.TASK_OUTCOME_CODE_FAILURE,
                 )
-                self.assertTrue(
-                    'RuntimeError("failed to get the invocation state for key")'
-                    in run_task_response.stderr
-                )
-
                 print(
                     "Joining invocation state client thread, it should exit immediately..."
                 )
                 client_thread.join()
+
+        self.assertIn(
+            'RuntimeError("failed to get the invocation state for key")',
+            fe.read_stderr(),
+        )
 
 
 class TestInvocationStateServerReconnect(unittest.TestCase):
@@ -465,9 +500,7 @@ class TestInvocationStateServerReconnect(unittest.TestCase):
                     request_id="0", success=True, set=SetInvocationStateResponse()
                 )
 
-        with FunctionExecutorProcessContextManager(
-            DEFAULT_FUNCTION_EXECUTOR_PORT + 5
-        ) as fe:
+        with FunctionExecutorProcessContextManager() as fe:
             with rpc_channel(fe) as channel:
                 stub: FunctionExecutorStub = FunctionExecutorStub(channel)
                 first_request_iterator: Iterator[InvocationStateRequest] = (
@@ -502,9 +535,7 @@ class TestInvocationStateServerReconnect(unittest.TestCase):
                     request_id="0", success=True, set=SetInvocationStateResponse()
                 )
 
-        with FunctionExecutorProcessContextManager(
-            DEFAULT_FUNCTION_EXECUTOR_PORT + 5
-        ) as fe:
+        with FunctionExecutorProcessContextManager() as fe:
             with rpc_channel(fe) as channel_1:
                 stub: FunctionExecutorStub = FunctionExecutorStub(channel_1)
                 first_request_iterator: Iterator[InvocationStateRequest] = (

@@ -6,10 +6,10 @@ import unittest
 
 from grpc import RpcError
 from testing import (
-    DEFAULT_FUNCTION_EXECUTOR_PORT,
     FunctionExecutorProcessContextManager,
     rpc_channel,
     run_task,
+    tmp_local_file_rw_blob,
 )
 
 from tensorlake import Graph
@@ -22,14 +22,15 @@ from tensorlake.function_executor.proto.function_executor_pb2 import (
     RunTaskResponse,
     SerializedObject,
     SerializedObjectEncoding,
+    SerializedObjectManifest,
     TaskOutcomeCode,
+    WriteOnlyBlob,
 )
 from tensorlake.function_executor.proto.function_executor_pb2_grpc import (
     FunctionExecutorStub,
 )
 from tensorlake.functions_sdk.functions import tensorlake_function
 from tensorlake.functions_sdk.graph_serialization import (
-    ZIPPED_GRAPH_CODE_CONTENT_TYPE,
     graph_code_dir_path,
     zip_graph_code,
 )
@@ -62,6 +63,10 @@ def action_function(action: str) -> str:
 
 
 def initialize(test_case: unittest.TestCase, stub: FunctionExecutorStub):
+    graph_data: bytes = zip_graph_code(
+        graph=Graph(name="test", description="test", start_node=action_function),
+        code_dir_path=GRAPH_CODE_DIR_PATH,
+    )
     initialize_response: InitializeResponse = stub.initialize(
         InitializeRequest(
             namespace="test",
@@ -69,14 +74,12 @@ def initialize(test_case: unittest.TestCase, stub: FunctionExecutorStub):
             graph_version="1",
             function_name="action_function",
             graph=SerializedObject(
-                data=zip_graph_code(
-                    graph=Graph(
-                        name="test", description="test", start_node=action_function
-                    ),
-                    code_dir_path=GRAPH_CODE_DIR_PATH,
+                manifest=SerializedObjectManifest(
+                    encoding=SerializedObjectEncoding.SERIALIZED_OBJECT_ENCODING_BINARY_ZIP,
+                    encoding_version=0,
+                    size=len(graph_data),
                 ),
-                encoding=SerializedObjectEncoding.SERIALIZED_OBJECT_ENCODING_BINARY_ZIP,
-                encoding_version=0,
+                data=graph_data,
             ),
         )
     )
@@ -105,9 +108,7 @@ def wait_health_check_failure(test_case: unittest.TestCase, stub: FunctionExecut
 
 class TestHealthCheck(unittest.TestCase):
     def test_not_initialized_fails(self):
-        with FunctionExecutorProcessContextManager(
-            DEFAULT_FUNCTION_EXECUTOR_PORT
-        ) as process:
+        with FunctionExecutorProcessContextManager() as process:
             with rpc_channel(process) as channel:
                 stub: FunctionExecutorStub = FunctionExecutorStub(channel)
                 try:
@@ -122,12 +123,11 @@ class TestHealthCheck(unittest.TestCase):
                     )
 
     def test_function_deadlock_success(self):
-        with FunctionExecutorProcessContextManager(
-            DEFAULT_FUNCTION_EXECUTOR_PORT + 1
-        ) as process:
+        with FunctionExecutorProcessContextManager() as process:
             with rpc_channel(process) as channel:
                 stub: FunctionExecutorStub = FunctionExecutorStub(channel)
                 initialize(self, stub)
+                function_outputs_blob: WriteOnlyBlob = tmp_local_file_rw_blob()
 
                 def run_task_in_thread():
                     try:
@@ -135,7 +135,8 @@ class TestHealthCheck(unittest.TestCase):
                             stub,
                             function_name="action_function",
                             input="deadlock",
-                            timeout=HEALTH_CHECK_TIMEOUT_SEC,
+                            function_outputs_blob=function_outputs_blob,
+                            timeout_sec=HEALTH_CHECK_TIMEOUT_SEC,
                         )
                         self.fail("Run task should have timed out.")
                     except RpcError:
@@ -153,16 +154,18 @@ class TestHealthCheck(unittest.TestCase):
                 task_thread.join()
 
     def test_function_raises_exception_success(self):
-        with FunctionExecutorProcessContextManager(
-            DEFAULT_FUNCTION_EXECUTOR_PORT + 2
-        ) as process:
+        with FunctionExecutorProcessContextManager() as process:
             with rpc_channel(process) as channel:
                 stub: FunctionExecutorStub = FunctionExecutorStub(channel)
                 initialize(self, stub)
+                function_outputs_blob: WriteOnlyBlob = tmp_local_file_rw_blob()
 
                 def run_task_in_thread():
                     response: RunTaskResponse = run_task(
-                        stub, function_name="action_function", input="raise_exception"
+                        stub,
+                        function_name="action_function",
+                        input="raise_exception",
+                        function_outputs_blob=function_outputs_blob,
                     )
                     self.assertEqual(
                         response.outcome_code, TaskOutcomeCode.TASK_OUTCOME_CODE_FAILURE
@@ -180,18 +183,20 @@ class TestHealthCheck(unittest.TestCase):
                 task_thread.join()
 
     def test_process_crash_failure(self):
-        with FunctionExecutorProcessContextManager(
-            DEFAULT_FUNCTION_EXECUTOR_PORT + 3
-        ) as process:
+        with FunctionExecutorProcessContextManager() as process:
             with rpc_channel(process) as channel:
                 stub: FunctionExecutorStub = FunctionExecutorStub(channel)
                 initialize(self, stub)
+                function_outputs_blob: WriteOnlyBlob = tmp_local_file_rw_blob()
 
                 def run_task_in_thread():
                     try:
                         # Due to "tcp keep-alive" property of the health checks the task should unblock with RpcError.
                         run_task(
-                            stub, function_name="action_function", input="crash_process"
+                            stub,
+                            function_name="action_function",
+                            input="crash_process",
+                            function_outputs_blob=function_outputs_blob,
                         )
                         self.fail("Run task should have failed.")
                     except RpcError:
@@ -204,12 +209,11 @@ class TestHealthCheck(unittest.TestCase):
                 task_thread.join()
 
     def test_process_closes_server_socket_failure(self):
-        with FunctionExecutorProcessContextManager(
-            DEFAULT_FUNCTION_EXECUTOR_PORT + 4
-        ) as process:
+        with FunctionExecutorProcessContextManager() as process:
             with rpc_channel(process) as channel:
                 stub: FunctionExecutorStub = FunctionExecutorStub(channel)
                 initialize(self, stub)
+                function_outputs_blob: WriteOnlyBlob = tmp_local_file_rw_blob()
 
                 def run_task_in_thread():
                     try:
@@ -218,6 +222,7 @@ class TestHealthCheck(unittest.TestCase):
                             stub,
                             function_name="action_function",
                             input="close_connections",
+                            function_outputs_blob=function_outputs_blob,
                         )
                         self.fail("Run task should have failed.")
                     except RpcError:

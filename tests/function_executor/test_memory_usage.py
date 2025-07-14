@@ -3,11 +3,11 @@ import unittest
 
 import psutil
 from testing import (
-    DEFAULT_FUNCTION_EXECUTOR_PORT,
     FunctionExecutorProcessContextManager,
     deserialized_function_output,
     rpc_channel,
     run_task,
+    tmp_local_file_rw_blob,
 )
 
 from tensorlake import Graph
@@ -18,14 +18,15 @@ from tensorlake.function_executor.proto.function_executor_pb2 import (
     RunTaskResponse,
     SerializedObject,
     SerializedObjectEncoding,
+    SerializedObjectManifest,
     TaskOutcomeCode,
+    WriteOnlyBlob,
 )
 from tensorlake.function_executor.proto.function_executor_pb2_grpc import (
     FunctionExecutorStub,
 )
 from tensorlake.functions_sdk.functions import tensorlake_function
 from tensorlake.functions_sdk.graph_serialization import (
-    ZIPPED_GRAPH_CODE_CONTENT_TYPE,
     graph_code_dir_path,
     zip_graph_code,
 )
@@ -50,10 +51,12 @@ def process_rss_mb(x: int) -> int:
 class TestMemoryUsage(unittest.TestCase):
     def test_memory_usage_is_below_max_threshold(self):
         graph = Graph(name="test", description="test", start_node=process_rss_mb)
+        graph_data: bytes = zip_graph_code(
+            graph=graph,
+            code_dir_path=GRAPH_CODE_DIR_PATH,
+        )
 
-        with FunctionExecutorProcessContextManager(
-            DEFAULT_FUNCTION_EXECUTOR_PORT
-        ) as process:
+        with FunctionExecutorProcessContextManager() as process:
             with rpc_channel(process) as channel:
                 stub: FunctionExecutorStub = FunctionExecutorStub(channel)
                 initialize_response: InitializeResponse = stub.initialize(
@@ -63,11 +66,12 @@ class TestMemoryUsage(unittest.TestCase):
                         graph_version="1",
                         function_name="process_rss_mb",
                         graph=SerializedObject(
-                            data=zip_graph_code(
-                                graph=graph, code_dir_path=GRAPH_CODE_DIR_PATH
+                            manifest=SerializedObjectManifest(
+                                encoding=SerializedObjectEncoding.SERIALIZED_OBJECT_ENCODING_BINARY_ZIP,
+                                encoding_version=0,
+                                size=len(graph_data),
                             ),
-                            encoding=SerializedObjectEncoding.SERIALIZED_OBJECT_ENCODING_BINARY_ZIP,
-                            encoding_version=0,
+                            data=graph_data,
                         ),
                     )
                 )
@@ -76,10 +80,12 @@ class TestMemoryUsage(unittest.TestCase):
                     InitializationOutcomeCode.INITIALIZE_OUTCOME_CODE_SUCCESS,
                 )
 
+                function_outputs_blob: WriteOnlyBlob = tmp_local_file_rw_blob()
                 run_task_response: RunTaskResponse = run_task(
                     stub,
                     function_name="process_rss_mb",
                     input=0,
+                    function_outputs_blob=function_outputs_blob,
                 )
 
                 self.assertEqual(
@@ -88,7 +94,7 @@ class TestMemoryUsage(unittest.TestCase):
                 )
 
                 fn_outputs = deserialized_function_output(
-                    self, run_task_response.function_outputs
+                    self, run_task_response.function_outputs, function_outputs_blob
                 )
                 self.assertEqual(len(fn_outputs), 1)
                 fe_process_rss_mb = fn_outputs[0]

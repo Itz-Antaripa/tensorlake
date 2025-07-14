@@ -29,7 +29,6 @@ def configure_logging_early():
 def configure_development_mode_logging(compact_tracebacks=True):
     processors = [
         structlog.contextvars.merge_contextvars,
-        structlog_suppressor,
         structlog.processors.add_log_level,
         structlog.dev.set_exc_info,
         structlog.processors.TimeStamper(fmt="%Y-%m-%d %H:%M:%S", utc=False),
@@ -49,7 +48,6 @@ def configure_development_mode_logging(compact_tracebacks=True):
 def configure_production_mode_logging():
     processors = [
         structlog.contextvars.merge_contextvars,
-        structlog_suppressor,
         structlog.processors.add_log_level,
         structlog.dev.set_exc_info,
         structlog.processors.format_exc_info,
@@ -57,23 +55,6 @@ def configure_production_mode_logging():
         structlog.processors.JSONRenderer(),
     ]
     structlog.configure(processors=processors)
-
-
-_suppress_logging = False
-
-
-def structlog_suppressor(logger, name, event_dict):
-    global _suppress_logging
-    if _suppress_logging:
-        raise structlog.DropEvent
-    else:
-        return event_dict
-
-
-def suppress():
-    global _suppress_logging
-    _suppress_logging = True
-    logging.getLogger().setLevel(logging.CRITICAL)
 
 
 def _compact_traceback_formatter(
